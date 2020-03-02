@@ -1,0 +1,217 @@
+---
+title: "Data Exploration Analysis: 2016 Presidential Election Example"
+name: "Glynnis Foley"
+output:
+  html_document: default
+  pdf_document: default
+editor_options: 
+  chunk_output_type: inline
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+
+indent1 = '    '
+indent2 = paste(rep(indent1, 2), collapse='')
+indent3 = paste(rep(indent1, 3), collapse='')
+
+doeval = TRUE
+doecho = FALSE
+
+library(knitr)
+library(tidyverse)
+library(kableExtra)
+library(ggmap)
+library(maps)
+library(Rtsne)
+library(NbClust)
+library(tree)
+library(maptree)
+library(class)
+library(glmnet)
+library(ROCR)
+library(dendextend)
+library(cowplot)
+library(kernlab)
+library(bindrcpp)
+options(warn=-1)
+```
+
+Predicting voter behavior is complicated for many reasons despite the tremendous effort in collecting, analyzing, and understanding many available datasets. 
+For our final project, we will analyze the 2016 presidential election dataset.
+
+# Background
+
+The presidential election in 2012 did not come as a surprise. Some correctly predicted the outcome of the election correctly including [Nate Silver](https://en.wikipedia.org/wiki/Nate_Silver), 
+and [many speculated his approach](https://www.theguardian.com/science/grrlscientist/2012/nov/08/nate-sliver-predict-us-election).
+
+Despite the success in 2012, the 2016 presidential election came as a 
+[big surprise](https://fivethirtyeight.com/features/the-polls-missed-trump-we-asked-pollsters-why/) 
+to many, and it was a clear example that even the current state-of-the-art technology can surprise us.
+
+Various factors make voter behavior prediction (and thus election forecasting) a hard problem. First, there may be changes in voting decisions over time. As time progresses, voting intentions are prone to changes. There are both measurable and unmeasurable, or national changes that may occur and change people's decisions on who to vote for. Thus, the data obtained may not be the actual candidates that voters will vote for on election day. Another problem is that the sample may not always be random, and voters may not answer truthfully during these surveys. For instance, many people may not pick up for phone surveys, or may lie about who they are going to vote for.  Finally, it is difficult to predict voter turnout.
+
+It was Nate Silver's  unique approach in 2012 that allowed him to achieve good predictions. Silver looks at the full range of probabilities instead of looking at the maximum probabilities. To do so, he calculates the probability of support for each date. Then, for the following day, he can use the model for the actual support to predict the probability that the support has shifted. If the actual polling numbers increase, then he can say tha the probability of the support is likely to be higher. This calculation is based on Bayes' Theorem and graph theory.
+
+There were many issues that could have led to poor predictions such as the following:
+
+In 2016, various polls were missed. The errors were spread unevenly. There was a turnout problem in the Democratic side, so the turnout models were badly off in many states. Also, it seems that Trump gained more support from undecided voters, or voters who were supporting a third-party candidate. 
+
+To make future predictions better, voter demographic information should be taken into account since it was observed that in states where there are more whites without college degrees, the more Trump outperformed his polls. By placing more emphasis on voter demographic information, we may better predict the factors that affect voter choice the most, and categorize them into respective groups.
+
+# Data
+
+```{r data, warning= FALSE, message=FALSE}
+
+## read data and convert candidate from string to factor
+election.raw <- read_delim("data/election/election.csv", delim = ",") %>% mutate(candidate=as.factor(candidate))
+
+census_meta <- read_delim("data/census/metadata.csv", delim = ";", col_names = FALSE) 
+census <- read_delim("data/census/census.csv", delim = ",") 
+```
+
+
+## Election data
+
+The meaning of each column in `election.raw` is clear except `fips`. The accronym is short for [Federal Information Processing Standard](https://en.wikipedia.org/wiki/FIPS_county_code).
+
+In our dataset, `fips` values denote the area (US, state, or county) that each row of data represent. For example, `fips` value of 6037 denotes Los Angeles County.
+
+```{r}
+kable(election.raw %>% filter(county == "Los Angeles County"))  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE)
+```
+
+Some rows in `election.raw` are summary rows and these rows have `county` value of `NA`. There are two kinds of summary rows:
+
+* Federal-level summary rows have `fips` value of `US`.
+* State-level summary rows have names of each states as `fips` value.
+
+```{r}
+election.raw <- election.raw %>% 
+  filter(fips !="2000")
+dim(election.raw)
+```
+We exclude fips=2000 because it represents Alaska. Alaska does not have counties, so that is why fips=2000 is the same as fips=AK.
+    
+## Census data
+
+Following is the first few rows of the `census` data:
+
+```{r, echo=FALSE}
+kable(census %>% head, "html")  %>% kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"), full_width=FALSE) %>% scroll_box(width = "100%")
+colnames(census)
+```
+
+### Census data: column metadata
+
+Column information is given in `metadata`.
+
+```{r, dependson=data, echo=FALSE, eval=FALSE}
+kable(census_meta)
+```
+
+## Data wrangling
+**Data set name changes**
+    * Federal-level summary into a `election_federal`.
+    
+    * State-level summary into a `election_state`.
+    
+    * Only county-level data is to be in `election`.
+```{r}
+election_federal<-filter(election.raw, is.na(county) & fips=="US")
+election_state <- filter(election.raw, is.na(county) & fips !="US")
+election<-election.raw %>% filter(!is.na(county))
+```
+
+**The full list of presidential candidates and the number of votes the received in the general election:**
+There were 31 named presidential candidates in the 2016 elections (1 factor is dedicated to the unnamed candidates as seen in the plot below).
+```{r}
+elect_plot <-election_federal %>%group_by(votes)
+elect_plot<-elect_plot[order(elect_plot$votes, decreasing = TRUE),]
+votes_graph<-ggplot(data=elect_plot, mapping=aes(elect_plot$candidate, elect_plot$votes)) + geom_bar(aes(reorder(elect_plot$candidate, -elect_plot$votes), elect_plot$votes), stat="identity") + theme(axis.text.x = element_text(angle = 65, hjust = 1)) + xlab("Candidate") + ylab("votes") + ggtitle("US Presidential Election 2016:\n Votes by Candidate")
+log_votes_graph <-ggplot(data=elect_plot, mapping=aes(elect_plot$candidate, log(elect_plot$votes))) + geom_histogram(aes(reorder(elect_plot$candidate, -log(elect_plot$votes)), log(elect_plot$votes)), stat="identity") + theme(axis.text.x = element_text(angle = 65, hjust = 1)) + xlab("Candidate") + ylab("log(votes)") + ggtitle("US Presidential Election 2016:\n Log(votes) by Candidate")
+plot_grid(votes_graph, log_votes_graph)
+```
+
+** The county and state winners:** 
+```{r}
+county_winner<-election %>%
+  group_by(fips) %>%
+    mutate(total=sum(votes), pct=votes/total) %>%
+    top_n(1) #because we want the highest row
+county_winner[]
+
+state_winner<-election_state %>%
+  group_by(fips) %>%
+  mutate(total=sum(votes), pct=votes/total) %>%
+  top_n(1)
+state_winner
+```
+    
+# Visualization
+
+Visualization is crucial for gaining insight and intuition during data mining. We will map our data onto maps using `ggplot2`
+
+```{r, message=FALSE}
+states <- map_data("state")
+
+ggplot(data = states) + 
+  geom_polygon(aes(x = long, y = lat, fill = region, group = group), color = "white") + 
+  coord_fixed(1.3) +
+  guides(fill=FALSE)
+```
+
+The variable `states` contain information to draw white polygons, and fill-colors are determined by `region`.
+
+** County-level map colored by county:**
+```{r}
+counties = map_data("county")
+
+ggplot(data = counties) + 
+  geom_polygon(aes(x = long, y = lat, fill = subregion, group = group), color = "white") + 
+  coord_fixed(1.3) +
+  guides(fill=FALSE)  # color legend is unnecessary and takes too long
+
+```
+
+**Next we colored the map by the winning candidate for each state.**
+  First, combine `states` variable and `state_winner` we created earlier using `left_join()`. 
+  Note that `left_join()` needs to match up values of states to join the tables.  A call to `left_join()` takes all the values from the first table and looks for matches in the second table. If it finds a match, it adds the data from the second table; if not, it adds missing values:
+  
+```{r, out.width="30%", fig.align="center", echo=FALSE, indent = indent1}
+  knitr::include_graphics("animated-left-join.gif")
+```  
+
+```{r}
+#create a new column for 'states'
+fips = state.abb[match(states$region, tolower(state.name))]
+states <- states %>% mutate(fips=fips)
+combinestate <- left_join(states, state_winner, by="fips")
+
+ggplot(data=combinestate) +
+  geom_polygon(aes(x = long, y = lat, fill = candidate, group = group), color = "white") +
+   coord_fixed(1.3) +
+  guides(fill=FALSE) + 
+  xlab("") + ylab("")
+```
+
+  
+```{r}
+county<-maps::county.fips%>%
+  separate(polyname,c("region","subregion"),sep=",")
+county_winner<-transform(county_winner,fips=as.numeric(fips))
+#county_winner<-select(county_winner,-"county")
+county<-left_join(county,county_winner, by="fips")
+county.locs<-left_join(counties,county,by="subregion")
+
+ggplot(data = county.locs) + 
+  geom_polygon(aes(x = long, y = lat, fill = candidate, group = group), color = "white") + 
+  coord_fixed(1.3) +
+  guides(fill=FALSE) +
+  xlab("")+ylab("")
+
+```
+
+  
+
